@@ -1,0 +1,7 @@
+satellites:
+  -name: NOAA-15
+  freq_mhz: 137.620
+  -name: NOAA-18
+  freq-mhz: 137.9125
+  -name: NOAA-19
+  freq-mhz: 137.100    

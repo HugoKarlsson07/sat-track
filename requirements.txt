@@ -1,0 +1,7 @@
+skyfield
+numpy
+scipy
+requests
+apscheduler
+pytz
+python-dateutil
