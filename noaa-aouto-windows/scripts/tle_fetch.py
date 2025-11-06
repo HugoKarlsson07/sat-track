@@ -7,7 +7,7 @@ import requests
 from pathlib import Path
 from datetime import datetime
 
-TLE_URL = "https://celestrak.com/NORAD/elements/noaa.txt"
+TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle"
 OUT = Path(__file__).resolve().parents[1] / "tle" / "noaa_tle.txt"
 OUT.parent.mkdir(parents=True, exist_ok=True)
 
