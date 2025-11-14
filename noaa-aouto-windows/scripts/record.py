@@ -1,8 +1,4 @@
-"""
-record.py
-Startar rtl_fm och sox för att spela in en NOAA APT-pass till WAV.
-Kan anropas med --start-time ISO för att vänta tills pass start.
-"""
+
 import argparse
 import subprocess
 import sys
