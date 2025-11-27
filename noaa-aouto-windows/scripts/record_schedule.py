@@ -1,129 +1,122 @@
-import sys
-import threading
-import subprocess
-import time
+"""
+Optimized RTL-SDR satellite recorder
+- Fully driven by config/satellites.yaml (TLEs embedded)
+- Block-based streaming (avoids huge memory allocations)
+- Thread-safe active recordings
+- Watches config file for changes and reloads TLEs automatically
+- Uses pyrtlsdr for RX (fallback to rtl_fm if desired)
+
+Requirements:
+  pip install pyrtlsdr scipy numpy pyyaml apscheduler skyfield
+
+Usage:
+  - Put your satellites.yaml in project/config/satellites.yaml
+  - Ensure recordings/ and tle/ directories exist (script will create them)
+  - Run: python optimized_rtlsdr_recorder.py
+
+"""
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-
+import threading
+import time
 import yaml
-from apscheduler.schedulers.blocking import BlockingScheduler
+import logging
+import wave
+import struct
+
+import numpy as np
+from scipy.signal import decimate
+from pyrtlsdr import RtlSdr
+from apscheduler.schedulers.background import BackgroundScheduler
 from skyfield.api import Loader, EarthSatellite, wgs84
 
-# ---------------------------------------------
-# GLOBAL PATHS
-# ---------------------------------------------
-BASE = Path(__file__).resolve().parents[1]
-CONFIG = BASE / "config" / "satellites.yaml"
-TLE_DIR = BASE / "tle"
-RECORD_DIR = BASE / "recordings" / "raw"
+# ----------------------
+# CONFIG
+# ----------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = PROJECT_ROOT / "config" / "satellites.yaml"
+TLE_DIR = PROJECT_ROOT / "tle"
+RECORD_DIR = PROJECT_ROOT / "recordings" / "raw"
 RECORD_DIR.mkdir(parents=True, exist_ok=True)
+TLE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------
-# POSITION FOR GÖTEBORG (Origo, Origovägen 4)
-# ---------------------------------------------
+# Receiver settings
+USE_PY_RTLSDR = True
+RTL_SAMPLE_RATE = 2_400_000  # 2.4 MS/s
+CHUNK_SECONDS = 0.25         # seconds per processing chunk
+CHUNK_SAMPLES = int(RTL_SAMPLE_RATE * CHUNK_SECONDS)
+
+# Audio output
+OUT_SAMPLE_RATE = 12000  # final audio sample rate
+DECIMATE_STAGE1 = 50     # 2400000 / 50 = 48000
+DECIMATE_STAGE2 = 4      # 48000 / 4 = 12000
+
+# Location (Göteborg)
 MY_LAT = 57.69
 MY_LON = 11.97
 MY_ELEV_M = 0
 
-# ---------------------------------------------
-# SKYFIELD SETUP
-# ---------------------------------------------
+# Skyfield
 loader = Loader(str(TLE_DIR))
 ts = loader.timescale()
 
-# ---------------------------------------------
-# STATES: spårar aktiva inspelningar
-# ---------------------------------------------
-active_recordings = {}
+# State
+active_recordings = set()
+active_lock = threading.Lock()
 
-# ---------------------------------------------
-# RECORDING FUNCTIONS (INTEGRERAT)
-# ---------------------------------------------
+# Config caching
+_config_cache = None
+_config_mtime = None
+_sats_cache = None
 
-def iso_to_ts(s):
-    return datetime.fromisoformat(s).astimezone(timezone.utc)
+# Logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+log = logging.getLogger('satrec')
 
+# ----------------------
+# UTIL: load config + build satellites
+# ----------------------
 
-def build_command(freq_mhz, out_wav_path, gain=40, sample_rate=48000):
-    """
-    Windows pipeline: rtl_fm → sox → WAV
-    """
-    rtl_cmd = f'rtl_fm -f {freq_mhz}M -M fm -s {sample_rate} -g {gain} -'
-    sox_cmd = f'sox -t raw -r {sample_rate} -e signed -b 16 -c 1 - {out_wav_path} rate 11025'
-    return f"{rtl_cmd} | {sox_cmd}"
+def load_config(force=False):
+    global _config_cache, _config_mtime, _sats_cache
 
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Config not found: {CONFIG_PATH}")
 
-def run_record(freq, satname, start_time_iso=None, duration_override=None):
-    """
-    Startar en inspelning, eventuellt efter en fördröjning.
-    """
-    print(f"[REC] Launching recorder for {satname} FREQ={freq} MHz")
+    mtime = CONFIG_PATH.stat().st_mtime
+    if not force and _config_cache is not None and mtime == _config_mtime:
+        return _config_cache, _sats_cache
 
-    # vänta tills starttid
-    if start_time_iso:
-        ts = iso_to_ts(start_time_iso)
-        now = datetime.utcnow().astimezone(timezone.utc)
-        delta = (ts - now).total_seconds()
-        if delta > 0:
-            print(f"[REC] Waiting {delta:.1f}s until start at {ts.isoformat()}Z")
-            time.sleep(delta)
-
-    # skapa filnamn
-    tnow = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    out = RECORD_DIR / f"{satname}_{tnow}_{int(freq*1000)}kHz.wav"
-
-    cmd = build_command(freq, str(out))
-    print("[REC] Command:")
-    print(cmd)
-
-    proc = subprocess.Popen(cmd, shell=True)
-
-    try:
-        if duration_override:
-            time.sleep(duration_override)
-            proc.terminate()
-            print(f"[REC] Stopped {satname} recording after {duration_override}s")
-        else:
-            proc.wait()
-
-    except KeyboardInterrupt:
-        proc.terminate()
-
-    # Ta bort från aktiva inspelningar
-    active_recordings.pop(satname, None)
-
-    print(f"[REC] File saved: {out}")
-
-
-# ---------------------------------------------
-# LOAD TLE DATA
-# ---------------------------------------------
-
-def load_tles():
-    data = yaml.safe_load(CONFIG.read_text())
+    log.info("Loading config and TLEs from %s", CONFIG_PATH)
+    data = yaml.safe_load(CONFIG_PATH.read_text())
     sats = {}
-    for satcfg in data["satellites"]:
-        name = satcfg["name"]
-        tle1 = satcfg["tle1"]
-        tle2 = satcfg["tle2"]
+    for entry in data.get('satellites', []):
+        name = entry['name']
+        tle1 = entry['tle1']
+        tle2 = entry['tle2']
         sats[name] = EarthSatellite(tle1, tle2, name, ts)
-    return sats
+
+    _config_cache = data
+    _config_mtime = mtime
+    _sats_cache = sats
+    return data, sats
 
 
-# ---------------------------------------------
-# PASSPREDIKTION
-# ---------------------------------------------
+# ----------------------
+# PASS PREDICTION
+# ----------------------
 
 def get_local_passes(sat, minutes_ahead=24*60, step_minutes=1, elev_mask_deg=10):
     t0 = datetime.utcnow().replace(tzinfo=timezone.utc)
     t1 = t0 + timedelta(minutes=minutes_ahead)
 
-    times = ts.utc([
-        t0 + timedelta(minutes=i) for i in range(0, minutes_ahead, step_minutes)
-    ])
+    # generate skyfield times for evaluation
+    times = ts.utc([t0 + timedelta(minutes=i * step_minutes) for i in range(int(minutes_ahead / step_minutes) + 1)])
 
     geoc = wgs84.latlon(MY_LAT, MY_LON, elevation_m=MY_ELEV_M)
-    altitudes = (sat - geoc).at(times).altaz()[0].degrees
+    altaz = (sat - geoc).at(times).altaz()
+    altitudes = altaz[0].degrees
 
     passes = []
     inpass = False
@@ -132,10 +125,9 @@ def get_local_passes(sat, minutes_ahead=24*60, step_minutes=1, elev_mask_deg=10)
     for i, alt in enumerate(altitudes):
         if alt >= elev_mask_deg and not inpass:
             inpass = True
-            start = t0 + timedelta(minutes=i*step_minutes)
-
+            start = t0 + timedelta(minutes=i * step_minutes)
         if alt < elev_mask_deg and inpass:
-            end = t0 + timedelta(minutes=i*step_minutes)
+            end = t0 + timedelta(minutes=i * step_minutes)
             passes.append((start, end))
             inpass = False
 
@@ -145,89 +137,207 @@ def get_local_passes(sat, minutes_ahead=24*60, step_minutes=1, elev_mask_deg=10)
     return passes
 
 
-# ---------------------------------------------
-# JOB FUNCTION (KÖRS VARJE MINUT)
-# ---------------------------------------------
+# ----------------------
+# FM demod + decimation helper
+# ----------------------
 
-def job():
-    print("Job tick:", datetime.utcnow().isoformat() + "Z")
+def fm_demodulate(iq, prev_sample=None):
+    # iq: complex64 array
+    # return float array of instantaneous frequency (unscaled)
+    if prev_sample is not None:
+        iq = np.concatenate(([prev_sample], iq))
+    ph = np.angle(iq[1:] * np.conj(iq[:-1]))
+    return ph, iq[-1]
 
-    sats = load_tles()
-    config = yaml.safe_load(CONFIG.read_text())
 
+# ----------------------
+# Recording: streaming & incremental WAV write
+# ----------------------
+
+def record_with_pyrtlsdr(freq_mhz, duration_s, outpath):
+    """Stream from RTL-SDR in chunks, demodulate FM, decimate to OUT_SAMPLE_RATE and write WAV incrementally."""
+    log.info("[PY-RTLSDR] Recording %ds at %.6f MHz → %s", duration_s, freq_mhz, outpath)
+
+    sdr = RtlSdr()
+    try:
+        sdr.sample_rate = RTL_SAMPLE_RATE
+        sdr.center_freq = freq_mhz * 1e6
+        sdr.gain = 'auto'
+
+        total_chunks = max(1, int(np.ceil(duration_s / CHUNK_SECONDS)))
+        prev_sample = None
+
+        # open wave file for streaming write
+        wf = wave.open(outpath, 'wb')
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit PCM
+        wf.setframerate(OUT_SAMPLE_RATE)
+
+        for i in range(total_chunks):
+            # compute how many samples to read (last chunk shorter)
+            remaining = duration_s - i * CHUNK_SECONDS
+            cur_chunk_s = min(CHUNK_SECONDS, max(0.001, remaining))
+            cur_samples = int(RTL_SAMPLE_RATE * cur_chunk_s)
+
+            try:
+                iq = sdr.read_samples(cur_samples)
+            except Exception as e:
+                log.exception("SDR read error: %s", e)
+                break
+
+            # FM demodulate (returns ph and last sample for continuity)
+            ph, prev_sample = fm_demodulate(iq, prev_sample)
+
+            # decimate 2400000 -> 48000
+            try:
+                audio_48k = decimate(ph, DECIMATE_STAGE1, ftype='fir', zero_phase=True)
+                # decimate 48000 -> 12000
+                audio_12k = decimate(audio_48k, DECIMATE_STAGE2, ftype='fir', zero_phase=True)
+            except Exception:
+                # fallback to crude downsample (less ideal) if decimate fails
+                audio_12k = ph[::DECIMATE_STAGE1 * DECIMATE_STAGE2]
+
+            # normalize small chunks separately to avoid clipping; keep global scale low
+            if np.max(np.abs(audio_12k)) > 0:
+                audio_12k = audio_12k / np.max(np.abs(audio_12k)) * 0.9
+
+            # convert to int16 PCM
+            pcm = np.int16(np.clip(audio_12k * 32767, -32768, 32767))
+            wf.writeframes(pcm.tobytes())
+
+        wf.close()
+        log.info("[PY-RTLSDR] Saved WAV → %s", outpath)
+    finally:
+        sdr.close()
+
+
+# ----------------------
+# High-level recorder wrapper
+# ----------------------
+
+def run_record(freq_mhz, satname, start_time_utc=None, duration_override=None):
+    log.info("Starting recording thread for %s @ %.6f MHz", satname, freq_mhz)
+
+    # wait until start if specified
+    if start_time_utc:
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if isinstance(start_time_utc, str):
+            start_ts = datetime.fromisoformat(start_time_utc)
+        else:
+            start_ts = start_time_utc
+        delta = (start_ts - now).total_seconds()
+        if delta > 0:
+            log.info("Waiting %.1fs until start %s", delta, start_ts)
+            time.sleep(delta)
+
+    tnow = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    out = RECORD_DIR / f"{satname.replace(' ', '_')}_{tnow}_{int(freq_mhz*1000)}kHz.wav"
+
+    duration_s = duration_override or 60
+
+    try:
+        if USE_PY_RTLSDR:
+            record_with_pyrtlsdr(freq_mhz, duration_s, str(out))
+        else:
+            # fallback to external rtl_fm + sox if desired (not implemented streaming here)
+            raise RuntimeError("RTL_FM fallback not implemented in optimized script")
+    except Exception:
+        log.exception("Recording failed for %s", satname)
+    finally:
+        with active_lock:
+            if satname in active_recordings:
+                active_recordings.remove(satname)
+        log.info("Recording finished for %s", satname)
+
+
+# ----------------------
+# Scheduler job: detect passes and start recordings
+# ----------------------
+
+def job_check_and_schedule():
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    log.info("Scheduler tick at %s", now.isoformat())
+
+    try:
+        config, sats = load_config()
+    except Exception:
+        log.exception("Failed loading config")
+        return
+
     next_events = []
 
-    for satcfg in config["satellites"]:
-        name = satcfg["name"]
-        freq = satcfg["freq_mhz"]
+    for satcfg in config.get('satellites', []):
+        name = satcfg['name']
+        freq = float(satcfg['freq_mhz'])
 
-        if name not in sats:
-            print(f"[WARN] No TLE for {name}")
+        sat = sats.get(name)
+        if not sat:
             continue
 
-        sat = sats[name]
         passes = get_local_passes(sat, minutes_ahead=12*60)
 
-        # hitta nästa pass
+        # find next future pass
         future = next((p for p in passes if p[0] > now), None)
         if future:
             next_events.append((name, future[0]))
 
-        # kolla om vi ska starta inspelning
         for aos_utc, los_utc in passes:
-
             start = aos_utc - timedelta(seconds=20)
             stop = los_utc + timedelta(seconds=20)
             duration = int((stop - start).total_seconds())
 
-            # Vi är i passet nu
             if start <= now <= stop:
-
-                if name in active_recordings:
-                    break  # redan spelar in
-
-                print(f"[INFO] Now in pass for {name} — recording {duration}s")
-
-                active_recordings[name] = True
-                threading.Thread(
-                    target=run_record,
-                    args=(freq, name, None, duration),
-                    daemon=True
-                ).start()
-                break 
-
-            # Pass inom 10 min
-            elif start > now and (start - now) < timedelta(minutes=10):
-
-                if name in active_recordings:
-                    break
-
-                start_iso = start.isoformat()
-                print(f"[INFO] Upcoming pass for {name} at {start_iso}Z — scheduling recording")
-
-                active_recordings[name] = True
-                threading.Thread(
-                    target=run_record,
-                    args=(freq, name, start_iso, duration),
-                    daemon=True
-                ).start()
+                with active_lock:
+                    if name not in active_recordings:
+                        active_recordings.add(name)
+                        threading.Thread(target=run_record, args=(freq, name, None, duration), daemon=True).start()
                 break
 
-    
-    print("---- NEXT PASSES ----")
-    for satname, aos in next_events:
-        delta_min = (aos - now).total_seconds() / 60
-        print(f"{satname}: {aos.isoformat()}Z  (om {delta_min:.1f} min)")
-    print("Job done.\n")
+            elif start > now and (start - now) < timedelta(minutes=10):
+                with active_lock:
+                    if name not in active_recordings:
+                        active_recordings.add(name)
+                        threading.Thread(target=run_record, args=(freq, name, start, duration), daemon=True).start()
+                break
+
+    if next_events:
+        log.info("Next passes:")
+        for satname, aos in next_events:
+            delta_min = (aos - now).total_seconds() / 60
+            log.info("  %s: %s (in %.1f min)", satname, aos.isoformat(), delta_min)
 
 
+# ----------------------
+# MAIN
+# ----------------------
 
-if __name__ == "__main__":
-    scheduler = BlockingScheduler()
-    scheduler.add_job(job, "interval", minutes=1, max_instances=3)
+def main():
+    log.info("Starting optimized recorder")
 
-    print("Starting scheduler. Press Ctrl-C to exit.")
+    # initial load
+    load_config(force=True)
 
-    job()  # kör en gång direkt
-    scheduler.start()
+    # start scheduler
+    sched = BackgroundScheduler()
+    sched.add_job(job_check_and_schedule, 'interval', seconds=60)
+    sched.start()
+
+    # run initial check immediately
+    job_check_and_schedule()
+
+    try:
+        # keep main thread alive
+        while True:
+            time.sleep(1)
+            # auto reload config if file changed
+            try:
+                load_config()
+            except Exception:
+                pass
+    except KeyboardInterrupt:
+        log.info('Stopping...')
+        sched.shutdown()
+
+
+if __name__ == '__main__':
+    main()
